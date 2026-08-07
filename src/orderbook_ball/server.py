@@ -8,14 +8,13 @@ import time
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
-import websockets
 
 from .core import TopOfBook, clip_ball, naive_ratio_of_mids, ratio_interval
 from .polymarket import (
-    WS,
     BinaryMarket,
     EventSearchResult,
     _message_updates,
+    connect_market_ws,
     resolve_binary_markets,
     search_binary_events,
 )
@@ -110,7 +109,7 @@ def create_app() -> FastAPI:
             )
 
             await ws.send_json({"type": "status", "state": "connecting"})
-            upstream = await websockets.connect(WS, ping_interval=None, close_timeout=3)
+            upstream = await connect_market_ws(ping_interval=None, close_timeout=3)
             await upstream.send(json.dumps({
                 "assets_ids": [market.a_token, market.aprime_token],
                 "type": "market",

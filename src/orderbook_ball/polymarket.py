@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import json
 from dataclasses import dataclass
 import logging
+import os
 from pathlib import Path
+import socket
 import time
 from urllib.parse import urlparse
 
+import httpx
 from polymarket import AsyncPublicClient, Event, Market
+from polymarket.clients._transport import AsyncTransport
 from polymarket.errors import RequestRejectedError
 import websockets
 
@@ -42,6 +47,58 @@ class EventSearchResult:
     liquidity: float | None
     end_date: str
     binary_market_count: int
+
+
+def _force_ipv4_enabled() -> bool:
+    value = os.getenv("ORDERBOOK_BALL_FORCE_IPV4", "1").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+@asynccontextmanager
+async def _public_client():
+    """Yield the official Polymarket client with an IPv4-bound Gamma transport.
+
+    httpx/httpcore resolves through AnyIO, so monkey-patching socket.getaddrinfo
+    isn't sufficient to force IPv4. Binding the transport to 0.0.0.0 makes the
+    underlying socket AF_INET and avoids broken IPv6 TLS paths while retaining
+    the SDK's typed request builders, pagination, and response parsing.
+
+    This touches the SDK's internal Gamma transport because v0.4 doesn't expose
+    transport injection publicly. The dependency is pinned to <0.5 accordingly.
+    """
+    client = AsyncPublicClient(logger=LOGGER)
+    ipv4_http: httpx.AsyncClient | None = None
+
+    if _force_ipv4_enabled():
+        gamma_url = client.environment.gamma_url
+        # Close the SDK-created Gamma pool before swapping it out.
+        await client._ctx.gamma.close()  # type: ignore[attr-defined]
+        ipv4_http = httpx.AsyncClient(
+            base_url=gamma_url,
+            timeout=httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=2.0),
+            transport=httpx.AsyncHTTPTransport(
+                local_address="0.0.0.0",
+                retries=1,
+                http2=True,
+            ),
+        )
+        gamma = AsyncTransport(base_url=gamma_url, client=ipv4_http, logger=LOGGER)
+        object.__setattr__(client._ctx, "gamma", gamma)  # type: ignore[attr-defined]
+
+    try:
+        async with client:
+            yield client
+    finally:
+        # AsyncTransport doesn't own a client injected by us, so close it here.
+        if ipv4_http is not None:
+            await ipv4_http.aclose()
+
+
+def connect_market_ws(**kwargs):
+    """Connect to the public CLOB market stream, forcing IPv4 when requested."""
+    if _force_ipv4_enabled():
+        kwargs.setdefault("family", socket.AF_INET)
+    return websockets.connect(WS, **kwargs)
 
 
 def _slug_from_input(value: str) -> str:
@@ -122,7 +179,7 @@ async def search_binary_events(query: str, limit: int = 8) -> list[EventSearchRe
     limit = max(1, min(int(limit), 12))
     page_size = min(24, max(limit * 2, 8))
 
-    async with AsyncPublicClient(logger=LOGGER) as client:
+    async with _public_client() as client:
         try:
             first = await client.search(
                 q=query,
@@ -133,9 +190,6 @@ async def search_binary_events(query: str, limit: int = 8) -> list[EventSearchRe
                 page_size=page_size,
             ).first_page()
         except RequestRejectedError as exc:
-            # Gamma occasionally changes optional search behavior independently of
-            # the SDK. A minimal SDK request is a useful fallback and still keeps
-            # all URL construction, parameter encoding, and response parsing typed.
             LOGGER.warning(
                 "filtered Polymarket search rejected for %r (%s); retrying minimal search",
                 query,
@@ -171,10 +225,7 @@ async def resolve_binary_markets(value: str) -> list[BinaryMarket]:
     if not value:
         raise RuntimeError("empty Polymarket market/event value")
 
-    async with AsyncPublicClient(logger=LOGGER) as client:
-        # The SDK understands canonical Polymarket URLs. Event pages are the
-        # pleasant human-facing form, while nested event/market URLs resolve as
-        # individual markets.
+    async with _public_client() as client:
         if "://" in value:
             parsed = urlparse(value)
             segments = [segment for segment in parsed.path.split("/") if segment]
@@ -291,7 +342,7 @@ async def record_market(
     print(f"recording to {out} — Ctrl+C to stop")
 
     try:
-        async with websockets.connect(WS, ping_interval=None, close_timeout=3) as ws:
+        async with connect_market_ws(ping_interval=None, close_timeout=3) as ws:
             await ws.send(json.dumps({
                 "assets_ids": [market.a_token, market.aprime_token],
                 "type": "market",

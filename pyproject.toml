@@ -5,6 +5,7 @@ description = "Path-dependent price estimates and temporal-spread visualization 
 requires-python = ">=3.11"
 dependencies = [
   "polymarket-client>=0.4,<0.5",
+  "httpx>=0.28",
   "websockets>=13",
   "numpy>=2.0",
   "fastapi>=0.115",
