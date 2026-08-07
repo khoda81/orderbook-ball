@@ -130,7 +130,8 @@ h2 { margin: 0 0 4px; font-size: 18px; font-weight: 600; }
 .canvas-wrap { position: relative; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
 .top-chart-wrap { height: 390px; }
 .heatmap-wrap { height: 320px; }
-canvas { display: block; width: 100%; height: 100%; }
+canvas { display: block; width: 100%; height: 100%; cursor: grab; user-select: none; }
+canvas.dragging { cursor: grabbing; }
 .empty-state { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); font-size: 13px; pointer-events: none; }
 .color-legend { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 11px; }
 .color-legend i { display: inline-block; width: 110px; height: 8px; border-radius: 10px; background: linear-gradient(90deg, #151820, #596d38, #dbff65); }

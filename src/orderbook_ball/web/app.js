@@ -19,11 +19,16 @@
   let showingHistory = false;
   let historySerial = 0;
   let heatScale = 'linear';
+  let heatGain = 1;
+  let manualView = null;
+  let dragState = null;
   let rafPending = false;
   const MAX_ROWS = 20000;
   const GRID_N = 150;
   const LIVE_WARMUP_MS = 120000;
   const LIVE_WARMUP_ROWS = 1500;
+  const MIN_VIEW_MS = 1000;
+  const CHART_PAD = {l:58,r:12,t:16,b:28};
 
   function setStatus(state, text) {
     els.status.className = `status ${state}`;
@@ -110,6 +115,7 @@
       if (!liveReady()) {
         rows = historyRows;
         showingHistory = true;
+        manualView = null;
         revealCharts();
         updateMetrics(historyRows[historyRows.length - 1]);
         scheduleRender();
@@ -127,6 +133,7 @@
     if (!liveRows.length) return;
     showingHistory = false;
     rows = liveRows;
+    manualView = null;
     updateMetrics(liveRows[liveRows.length - 1]);
     revealCharts();
     setStatus(liveConnected ? 'connected' : 'idle', liveConnected ? 'Live' : 'Captured');
@@ -214,6 +221,9 @@
     liveRows = [];
     historyRows = [];
     showingHistory = false;
+    manualView = null;
+    heatGain = 1;
+    dragState = null;
     els.ballValue.textContent = '—'; els.ballOdds.textContent = 'log A/A′'; els.probValue.textContent = '—'; els.spreadValue.textContent = '—'; els.sampleValue.textContent = '0';
     els.exportButton.disabled = true; els.clearButton.disabled = true;
     els.priceEmpty.classList.remove('hidden'); els.heatmapEmpty.classList.remove('hidden');
@@ -228,23 +238,64 @@
     els.sampleValue.textContent = rows.length.toLocaleString();
   }
 
+  function fullTimeRange() {
+    if (!rows.length) return null;
+    const lo = rows[0].ts_ms;
+    const hi = Math.max(lo + 1, rows[rows.length - 1].ts_ms);
+    return [lo, hi];
+  }
+
+  function automaticTimeRange() {
+    const full = fullTimeRange();
+    if (!full) return null;
+    const [lo, hi] = full;
+    const seconds = Number(els.windowSelect.value);
+    return seconds > 0 ? [Math.max(lo, hi - seconds * 1000), hi] : [lo, hi];
+  }
+
+  function clampTimeRange(start, end) {
+    const full = fullTimeRange();
+    if (!full) return null;
+    const [lo, hi] = full;
+    const fullSpan = hi - lo;
+    if (fullSpan <= 1) return [lo, hi];
+    const minSpan = Math.min(MIN_VIEW_MS, fullSpan);
+    const span = Math.min(fullSpan, Math.max(minSpan, end - start));
+    if (span >= fullSpan) return [lo, hi];
+    let a = start;
+    let b = start + span;
+    if (a < lo) { b += lo - a; a = lo; }
+    if (b > hi) { a -= b - hi; b = hi; }
+    return [Math.max(lo, a), Math.min(hi, b)];
+  }
+
+  function effectiveTimeRange() {
+    if (manualView) {
+      manualView = clampTimeRange(manualView[0], manualView[1]);
+      return manualView;
+    }
+    return automaticTimeRange();
+  }
+
   function visibleRows() {
     if (!rows.length) return [];
-    const seconds = Number(els.windowSelect.value);
-    let out = rows;
-    if (seconds > 0) {
-      const cutoff = rows[rows.length - 1].ts_ms - seconds * 1000;
-      let i = rows.length - 1;
-      while (i > 0 && rows[i - 1].ts_ms >= cutoff) i--;
-      out = rows.slice(i);
-    }
+    const range = effectiveTimeRange();
+    if (!range) return [];
+    const [start, end] = range;
+    let first = 0;
+    while (first < rows.length - 1 && rows[first].ts_ms < start) first++;
+    first = Math.max(0, first - 1);
+    let last = first;
+    while (last < rows.length && rows[last].ts_ms <= end) last++;
+    let out = rows.slice(first, Math.min(rows.length, last + 1));
+
     const cap = 3500;
     if (out.length > cap) {
       const stride = Math.ceil(out.length / cap);
       const sampled = [];
       for (let i = 0; i < out.length; i += stride) sampled.push(out[i]);
       if (sampled[sampled.length - 1] !== out[out.length - 1]) sampled.push(out[out.length - 1]);
-      return sampled;
+      out = sampled;
     }
     return out;
   }
@@ -306,7 +357,7 @@
   function drawPrice(data) {
     const {ctx,w,h} = setupCanvas(els.priceCanvas); ctx.clearRect(0,0,w,h);
     if (data.length < 1) return;
-    const pad = {l:58,r:12,t:16,b:28};
+    const pad = CHART_PAD;
     const [yLo,yHi] = bounds(data); const t0=data[0].ts_ms, t1=Math.max(t0+1,data[data.length-1].ts_ms);
     const x = t => pad.l + (t-t0)/(t1-t0)*(w-pad.l-pad.r);
     const y = q => pad.t + (yHi-q)/(yHi-yLo)*(h-pad.t-pad.b);
@@ -342,7 +393,7 @@
   function drawHeatmap(data) {
     const {ctx,w,h} = setupCanvas(els.heatmapCanvas); ctx.clearRect(0,0,w,h);
     if (data.length < 1) return;
-    const pad={l:58,r:12,t:16,b:28}; const [yLo,yHi]=bounds(data); const t0=data[0].ts_ms,t1=Math.max(t0+1,data[data.length-1].ts_ms);
+    const pad=CHART_PAD; const [yLo,yHi]=bounds(data); const t0=data[0].ts_ms,t1=Math.max(t0+1,data[data.length-1].ts_ms);
     drawAxes(ctx,w,h,pad,yLo,yHi,t0,t1);
     const plotW=w-pad.l-pad.r, plotH=h-pad.t-pad.b;
     const qGrid=Array.from({length:GRID_N},(_,j)=>yLo+(yHi-yLo)*j/(GRID_N-1));
@@ -368,14 +419,14 @@
       for (let j=0;j<GRID_N;j++) {
         const age=cells[i][j]; if (!Number.isFinite(age)) continue;
         const value=heatScale==='log' ? Math.log1p(age) : age;
-        const u=Math.min(1,value/transformedMax);
+        const u=Math.min(1, heatGain * value/transformedMax);
         const yy=pad.t + plotH - (j+1)/GRID_N*plotH;
         ctx.fillStyle=mixColor(u); ctx.fillRect(x0,yy,Math.max(1,x1-x0),plotH/GRID_N+1);
       }
     }
     ctx.beginPath(); ctx.strokeStyle=css('--text'); ctx.lineWidth=1.15; ctx.globalAlpha=.9;
     data.forEach((r,i)=>{const X=pad.l+(r.ts_ms-t0)/(t1-t0)*plotW,Y=pad.t+(yHi-r.q_ball)/(yHi-yLo)*plotH;i?ctx.lineTo(X,Y):ctx.moveTo(X,Y);}); ctx.stroke();ctx.globalAlpha=1;
-    els.colorLegend.lastElementChild.textContent = `${rawMax < 10 ? rawMax.toFixed(1) : rawMax.toFixed(0)} s (p97)`;
+    els.colorLegend.lastElementChild.textContent = `${rawMax < 10 ? rawMax.toFixed(1) : rawMax.toFixed(0)} s (p97) · ${heatGain.toFixed(2)}×`;
   }
 
   function setHeatScale(which) {
@@ -386,6 +437,91 @@
       ? 'Color = Δt: seconds since each q level was last outside the spread (linear color scale).'
       : 'Color = log(1 + Δt), while the legend remains labeled in actual seconds.';
     scheduleRender();
+  }
+
+  function pointerFraction(canvas, e) {
+    const rect = canvas.getBoundingClientRect();
+    const plotW = Math.max(1, rect.width - CHART_PAD.l - CHART_PAD.r);
+    return Math.max(0, Math.min(1, (e.clientX - rect.left - CHART_PAD.l) / plotW));
+  }
+
+  function zoomTime(canvas, e) {
+    const range = effectiveTimeRange();
+    const full = fullTimeRange();
+    if (!range || !full) return;
+    const [start, end] = range;
+    const currentSpan = Math.max(1, end - start);
+    const fullSpan = Math.max(1, full[1] - full[0]);
+    const factor = Math.exp(e.deltaY * 0.0015);
+    const newSpan = Math.min(fullSpan, Math.max(Math.min(MIN_VIEW_MS, fullSpan), currentSpan * factor));
+    const f = pointerFraction(canvas, e);
+    const anchor = start + f * currentSpan;
+    manualView = clampTimeRange(anchor - f * newSpan, anchor + (1 - f) * newSpan);
+    scheduleRender();
+  }
+
+  function changeHeatGain(e) {
+    heatGain = Math.max(0.05, Math.min(20, heatGain * Math.exp(-e.deltaY * 0.0015)));
+    scheduleRender();
+  }
+
+  function chartWheel(e) {
+    if (e.ctrlKey) {
+      e.preventDefault();
+      zoomTime(e.currentTarget, e);
+      return;
+    }
+    if (e.shiftKey && e.currentTarget === els.heatmapCanvas) {
+      e.preventDefault();
+      changeHeatGain(e);
+    }
+  }
+
+  function startPan(e) {
+    if (e.button !== 0 || !rows.length) return;
+    const range = effectiveTimeRange();
+    if (!range) return;
+    dragState = {
+      canvas: e.currentTarget,
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      range: [range[0], range[1]],
+    };
+    e.currentTarget.setPointerCapture(e.pointerId);
+    e.currentTarget.classList.add('dragging');
+    e.preventDefault();
+  }
+
+  function movePan(e) {
+    if (!dragState || dragState.canvas !== e.currentTarget || dragState.pointerId !== e.pointerId) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const plotW = Math.max(1, rect.width - CHART_PAD.l - CHART_PAD.r);
+    const span = dragState.range[1] - dragState.range[0];
+    const shift = -(e.clientX - dragState.startX) / plotW * span;
+    manualView = clampTimeRange(dragState.range[0] + shift, dragState.range[1] + shift);
+    scheduleRender();
+  }
+
+  function endPan(e) {
+    if (!dragState || dragState.canvas !== e.currentTarget || dragState.pointerId !== e.pointerId) return;
+    try { e.currentTarget.releasePointerCapture(e.pointerId); } catch (_) {}
+    e.currentTarget.classList.remove('dragging');
+    dragState = null;
+  }
+
+  function resetChartView() {
+    manualView = null;
+    heatGain = 1;
+    scheduleRender();
+  }
+
+  function bindChartInteractions(canvas) {
+    canvas.addEventListener('wheel', chartWheel, {passive:false});
+    canvas.addEventListener('pointerdown', startPan);
+    canvas.addEventListener('pointermove', movePan);
+    canvas.addEventListener('pointerup', endPan);
+    canvas.addEventListener('pointercancel', endPan);
+    canvas.addEventListener('dblclick', resetChartView);
   }
 
   function exportCsv() {
@@ -406,6 +542,8 @@
   els.clearButton.addEventListener('click', clearData);
   els.linearScale.addEventListener('click', ()=>setHeatScale('linear'));
   els.logScale.addEventListener('click', ()=>setHeatScale('log'));
-  els.windowSelect.addEventListener('change', scheduleRender);
+  els.windowSelect.addEventListener('change', ()=>{manualView=null; scheduleRender();});
+  bindChartInteractions(els.priceCanvas);
+  bindChartInteractions(els.heatmapCanvas);
   window.addEventListener('resize', scheduleRender);
 })();
