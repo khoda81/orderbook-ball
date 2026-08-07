@@ -1,0 +1,32 @@
+[project]
+name = "orderbook-ball"
+version = "0.2.0"
+description = "Path-dependent price estimates and temporal-spread visualization for order books"
+requires-python = ">=3.11"
+dependencies = [
+  "httpx>=0.27",
+  "websockets>=13",
+  "numpy>=2.0",
+  "fastapi>=0.115",
+  "uvicorn>=0.30",
+]
+
+[project.optional-dependencies]
+plot = [
+  "matplotlib>=3.9",
+]
+history = [
+  "matplotlib>=3.9",
+  "pyarrow>=17",
+  "huggingface-hub>=0.27",
+]
+
+[project.scripts]
+obball = "orderbook_ball.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/orderbook_ball"]

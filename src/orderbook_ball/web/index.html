@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Order-book ball</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="hero">
+      <div>
+        <div class="eyebrow">ORDER-BOOK BALL</div>
+        <h1>Price with memory.</h1>
+        <p>Live <code>q = log(A/A′)</code> spread, causal ball, and temporal-spread field for binary prediction markets.</p>
+      </div>
+      <div id="status" class="status idle"><span></span>Idle</div>
+    </header>
+
+    <section class="control-panel">
+      <div class="market-row">
+        <label class="grow">
+          <span>Polymarket URL or slug</span>
+          <input id="marketInput" type="text" placeholder="https://polymarket.com/event/…" autocomplete="off">
+        </label>
+        <button id="loadButton" class="primary" type="button">Load market</button>
+      </div>
+
+      <div id="marketChooser" class="chooser hidden">
+        <label>
+          <span>Binary submarket</span>
+          <select id="marketSelect"></select>
+        </label>
+        <button id="connectButton" class="primary" type="button">Connect live</button>
+      </div>
+
+      <div class="toolbar">
+        <div class="segmented" aria-label="Heatmap color scale">
+          <span class="seg-label">Heatmap</span>
+          <button id="linearScale" class="selected" type="button">Linear Δt</button>
+          <button id="logScale" type="button">log(1 + Δt)</button>
+        </div>
+        <label class="compact-control">
+          <span>Window</span>
+          <select id="windowSelect">
+            <option value="120">2 min</option>
+            <option value="300" selected>5 min</option>
+            <option value="900">15 min</option>
+            <option value="3600">1 h</option>
+            <option value="0">All (capped)</option>
+          </select>
+        </label>
+        <button id="disconnectButton" type="button" disabled>Disconnect</button>
+        <button id="exportButton" type="button" disabled>Export CSV</button>
+        <button id="clearButton" type="button" disabled>Clear</button>
+      </div>
+      <div id="message" class="message" aria-live="polite"></div>
+    </section>
+
+    <section class="metrics" aria-label="Current values">
+      <article><span>Ball q</span><strong id="ballValue">—</strong><small id="ballOdds">log A/A′</small></article>
+      <article><span>Implied A share</span><strong id="probValue">—</strong><small>σ(q ball)</small></article>
+      <article><span>Executable spread</span><strong id="spreadValue">—</strong><small>q ask − q bid</small></article>
+      <article><span>Samples</span><strong id="sampleValue">0</strong><small>paired book updates</small></article>
+    </section>
+
+    <section class="viz-section">
+      <div class="viz-heading">
+        <div>
+          <h2>Ratio price</h2>
+          <p>The ball moves only when the executable interval pushes it.</p>
+        </div>
+        <div class="legend">
+          <span><i class="spread-key"></i>spread</span>
+          <span><i class="ball-key"></i>ball</span>
+          <span><i class="mid-key"></i>ratio midpoint</span>
+          <span><i class="naive-key"></i>ratio of mids</span>
+        </div>
+      </div>
+      <div class="canvas-wrap top-chart-wrap">
+        <canvas id="priceCanvas"></canvas>
+        <div id="priceEmpty" class="empty-state">Connect to a market to start streaming.</div>
+      </div>
+    </section>
+
+    <section class="viz-section">
+      <div class="viz-heading">
+        <div>
+          <h2>Temporal spread</h2>
+          <p id="heatmapCaption">Color = seconds since each q level was last outside the spread.</p>
+        </div>
+        <div id="colorLegend" class="color-legend"><span>0 s</span><i></i><span>—</span></div>
+      </div>
+      <div class="canvas-wrap heatmap-wrap">
+        <canvas id="heatmapCanvas"></canvas>
+        <div id="heatmapEmpty" class="empty-state">The spread's memory field will appear here.</div>
+      </div>
+    </section>
+
+    <footer>
+      <span>q<sub>bid</sub> = log(bid<sub>A</sub>/ask<sub>A′</sub>)</span>
+      <span>q<sub>ask</sub> = log(ask<sub>A</sub>/bid<sub>A′</sub>)</span>
+      <span>q<sub>ball,t</sub> = clip(q<sub>ball,t−1</sub>, q<sub>bid,t</sub>, q<sub>ask,t</sub>)</span>
+    </footer>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>

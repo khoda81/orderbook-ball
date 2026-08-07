@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+
+# Local captures / generated outputs
+data/live*.csv
+openmarket_demo.png
+live*.png
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
