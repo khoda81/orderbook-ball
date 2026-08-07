@@ -114,7 +114,7 @@ def create_app() -> FastAPI:
             result = await load_pmxt_history(
                 market,
                 max_rows=int(config.get("max_rows") or 6000),
-                archive_files=int(config.get("archive_files") or 6),
+                archive_files=int(config.get("archive_files") or 2),
             )
             return {
                 "source": result.source,
@@ -197,8 +197,6 @@ def create_app() -> FastAPI:
                 sequence += 1
                 await ws.send_json({
                     "type": "tick",
-                    "source": "live",
-                    "historical": False,
                     "sequence": sequence,
                     "ts_ms": source_ts,
                     "recv_ts_ms": recv_ts_ms,

@@ -93,7 +93,7 @@
       const res = await fetch('/api/history', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({...market, max_rows: 6000, archive_files: 6}),
+        body: JSON.stringify({...market, max_rows: 6000, archive_files: 2}),
       });
       const data = await res.json();
       if (serial !== historySerial) return;
