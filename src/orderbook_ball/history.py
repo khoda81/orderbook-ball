@@ -24,6 +24,7 @@ _FILE_RE = re.compile(
     re.IGNORECASE,
 )
 _INDEX_CACHE_TTL_S = 300
+_HISTORY_LOOKBACK_FILES = 12
 _index_cache_at = 0.0
 _index_cache_urls: list[str] = []
 _proxy_lock = threading.Lock()
@@ -308,29 +309,46 @@ async def load_pmxt_history(
 ) -> HistoryBootstrap:
     """Bootstrap a market with the newest available PMXT millisecond quote history.
 
-    PMXT v2 is an hourly archive, so it intentionally lags the live stream. The
-    browser treats this as an archive preview rather than pretending the gap to
-    live data was continuously observed.
+    Start with a small newest-first batch so active markets stay cheap. If that
+    batch has no pairable rows, progressively look farther back (up to roughly
+    half a day by default) instead of declaring the market history-free after
+    only two hourly archive objects.
     """
     max_rows = max(100, min(int(max_rows), 12_000))
     archive_files = max(1, min(int(archive_files), 6))
-    urls = await _recent_pmxt_urls(archive_files)
-    if not urls:
+    probe_urls = await _recent_pmxt_urls(max(_HISTORY_LOOKBACK_FILES, archive_files))
+    if not probe_urls:
         return HistoryBootstrap("pmxt-v2", [], 0, None)
 
-    # Ask for extra single-leg rows because two token streams must be paired.
     raw_limit = min(60_000, max_rows * 4)
-    raw = await asyncio.to_thread(_query_pmxt_rows, urls, market, raw_limit)
-    rows = _pair_history(raw, market, max_rows)
+    accumulated_raw: list[tuple[int, int, str, float, float]] = []
+    rows: list[dict[str, object]] = []
+    scanned = 0
+
+    for offset in range(0, len(probe_urls), archive_files):
+        batch = probe_urls[offset : offset + archive_files]
+        if not batch:
+            break
+        scanned += len(batch)
+        batch_raw = await asyncio.to_thread(_query_pmxt_rows, batch, market, raw_limit)
+
+        # We probe newest -> oldest. Prepend older rows so the accumulated stream
+        # remains chronological and can carry one token's last quote across an
+        # hourly boundary if the other token is sparse in the newest file.
+        if batch_raw:
+            accumulated_raw = batch_raw + accumulated_raw
+            rows = _pair_history(accumulated_raw, market, max_rows)
+            if rows:
+                break
 
     newest = None
-    if urls:
-        match = re.search(r"(\d{4}-\d{2}-\d{2}T\d{2})\.parquet$", urls[0])
+    if probe_urls:
+        match = re.search(r"(\d{4}-\d{2}-\d{2}T\d{2})\.parquet$", probe_urls[0])
         newest = match.group(1) if match else None
 
     return HistoryBootstrap(
         source="pmxt-v2",
         rows=rows,
-        archive_file_count=len(urls),
+        archive_file_count=scanned,
         newest_archive_hour=newest,
     )
