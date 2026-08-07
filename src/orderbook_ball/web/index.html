@@ -19,11 +19,18 @@
 
     <section class="control-panel">
       <div class="market-row">
-        <label class="grow">
-          <span>Polymarket URL or slug</span>
-          <input id="marketInput" type="text" placeholder="https://polymarket.com/event/…" autocomplete="off">
-        </label>
-        <button id="loadButton" class="primary" type="button">Load market</button>
+        <div class="grow search-field">
+          <label for="marketInput"><span>Search Polymarket</span></label>
+          <div class="search-input-wrap">
+            <input id="marketInput" type="text"
+              placeholder="Bitcoin, Fed, election… or paste a Polymarket URL"
+              autocomplete="off" spellcheck="false"
+              aria-autocomplete="list" aria-controls="searchResults" aria-expanded="false">
+            <div id="searchResults" class="search-results hidden" role="listbox" aria-label="Polymarket search results"></div>
+          </div>
+          <small class="field-hint">Searches live Polymarket events as you type. URLs and exact slugs still work.</small>
+        </div>
+        <button id="loadButton" class="primary resolve-button" type="button">Resolve URL / slug</button>
       </div>
 
       <div id="marketChooser" class="chooser hidden">
@@ -79,7 +86,7 @@
       </div>
       <div class="canvas-wrap top-chart-wrap">
         <canvas id="priceCanvas"></canvas>
-        <div id="priceEmpty" class="empty-state">Connect to a market to start streaming.</div>
+        <div id="priceEmpty" class="empty-state">Pick a market above to start streaming.</div>
       </div>
     </section>
 
@@ -104,5 +111,6 @@
     </footer>
   </main>
   <script src="/app.js"></script>
+  <script src="/search.js"></script>
 </body>
 </html>

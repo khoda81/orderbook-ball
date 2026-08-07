@@ -10,7 +10,14 @@ from fastapi.responses import FileResponse
 import websockets
 
 from .core import TopOfBook, clip_ball, naive_ratio_of_mids, ratio_interval
-from .polymarket import WS, BinaryMarket, _message_updates, resolve_binary_markets
+from .polymarket import (
+    WS,
+    BinaryMarket,
+    EventSearchResult,
+    _message_updates,
+    resolve_binary_markets,
+    search_binary_events,
+)
 
 WEB_DIR = Path(__file__).with_name("web")
 
@@ -27,6 +34,21 @@ def _market_json(m: BinaryMarket) -> dict[str, str]:
     }
 
 
+def _search_json(event: EventSearchResult) -> dict[str, object]:
+    return {
+        "id": event.event_id,
+        "slug": event.slug,
+        "title": event.title,
+        "subtitle": event.subtitle,
+        "icon": event.icon,
+        "volume": event.volume,
+        "volume_24h": event.volume_24h,
+        "liquidity": event.liquidity,
+        "end_date": event.end_date,
+        "binary_market_count": event.binary_market_count,
+    }
+
+
 def create_app() -> FastAPI:
     app = FastAPI(title="Order-book ball")
 
@@ -38,9 +60,24 @@ def create_app() -> FastAPI:
     async def js():
         return FileResponse(WEB_DIR / "app.js", media_type="text/javascript")
 
+    @app.get("/search.js")
+    async def search_js():
+        return FileResponse(WEB_DIR / "search.js", media_type="text/javascript")
+
     @app.get("/styles.css")
     async def css():
         return FileResponse(WEB_DIR / "styles.css", media_type="text/css")
+
+    @app.get("/api/search")
+    async def search(q: str, limit: int = 8):
+        query = q.strip()
+        if len(query) < 2:
+            return {"events": []}
+        try:
+            found = await search_binary_events(query, limit=limit)
+        except Exception as exc:  # Upstream discovery boundary.
+            raise HTTPException(status_code=502, detail=f"Polymarket search failed: {exc}") from exc
+        return {"events": [_search_json(event) for event in found]}
 
     @app.get("/api/markets")
     async def markets(value: str):

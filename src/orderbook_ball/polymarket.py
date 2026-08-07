@@ -28,6 +28,20 @@ class BinaryMarket:
     aprime_token: str
 
 
+@dataclass(frozen=True)
+class EventSearchResult:
+    event_id: str
+    slug: str
+    title: str
+    subtitle: str
+    icon: str
+    volume: float | None
+    volume_24h: float | None
+    liquidity: float | None
+    end_date: str
+    binary_market_count: int
+
+
 def _decode_jsonish(value):
     if isinstance(value, str):
         try:
@@ -60,6 +74,92 @@ def _market_from_gamma(m: dict) -> BinaryMarket | None:
         a_token=str(token_ids[0]),
         aprime_token=str(token_ids[1]),
     )
+
+
+def _number(value) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _event_icon(event: dict) -> str:
+    for optimized_key in ("iconOptimized", "imageOptimized"):
+        optimized = event.get(optimized_key)
+        if isinstance(optimized, dict):
+            url = optimized.get("imageUrlOptimized") or optimized.get("imageUrlSource")
+            if url:
+                return str(url)
+    return str(event.get("icon") or event.get("image") or "")
+
+
+def _is_live_binary_market(raw: dict) -> bool:
+    if raw.get("closed") is True or raw.get("archived") is True:
+        return False
+    if raw.get("active") is False or raw.get("enableOrderBook") is False:
+        return False
+    return _market_from_gamma(raw) is not None
+
+
+def _search_result_from_gamma(event: dict) -> EventSearchResult | None:
+    markets = event.get("markets") or []
+    if not isinstance(markets, list):
+        return None
+    binary_count = sum(1 for market in markets if isinstance(market, dict) and _is_live_binary_market(market))
+    if binary_count == 0:
+        return None
+
+    title = str(event.get("title") or event.get("question") or "Untitled event")
+    subtitle = str(event.get("subtitle") or event.get("category") or "")
+    return EventSearchResult(
+        event_id=str(event.get("id") or ""),
+        slug=str(event.get("slug") or ""),
+        title=title,
+        subtitle=subtitle,
+        icon=_event_icon(event),
+        volume=_number(event.get("volume")),
+        volume_24h=_number(event.get("volume24hr") or event.get("volume_24hr")),
+        liquidity=_number(event.get("liquidity")),
+        end_date=str(event.get("endDate") or event.get("end_date") or ""),
+        binary_market_count=binary_count,
+    )
+
+
+async def search_binary_events(query: str, limit: int = 8) -> list[EventSearchResult]:
+    """Search Polymarket's public Gamma catalog for active events with binary CLOB markets."""
+    query = query.strip()
+    if len(query) < 2:
+        return []
+    limit = max(1, min(int(limit), 12))
+    params = {
+        "q": query,
+        "events_status": "active",
+        "limit_per_type": min(24, max(limit * 2, 8)),
+        "keep_closed_markets": 0,
+        "search_tags": False,
+        "search_profiles": False,
+    }
+    async with httpx.AsyncClient(timeout=10) as client:
+        response = await client.get(f"{GAMMA}/public-search", params=params)
+        response.raise_for_status()
+        payload = response.json()
+
+    events = payload.get("events") if isinstance(payload, dict) else None
+    if not isinstance(events, list):
+        return []
+
+    results: list[EventSearchResult] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        result = _search_result_from_gamma(event)
+        if result is not None:
+            results.append(result)
+        if len(results) >= limit:
+            break
+    return results
 
 
 async def resolve_binary_markets(value: str) -> list[BinaryMarket]:
