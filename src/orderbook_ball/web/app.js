@@ -12,11 +12,18 @@
 
   let markets = [];
   let socket = null;
+  let liveConnected = false;
   let rows = [];
+  let liveRows = [];
+  let historyRows = [];
+  let showingHistory = false;
+  let historySerial = 0;
   let heatScale = 'linear';
   let rafPending = false;
   const MAX_ROWS = 20000;
   const GRID_N = 150;
+  const LIVE_WARMUP_MS = 120000;
+  const LIVE_WARMUP_ROWS = 1500;
 
   function setStatus(state, text) {
     els.status.className = `status ${state}`;
@@ -33,10 +40,22 @@
     if (q >= 0) return 1 / (1 + Math.exp(-q));
     const e = Math.exp(q); return e / (1 + e);
   }
+  function liveReady() {
+    if (liveRows.length < 2) return false;
+    const first = liveRows[0].recv_ts_ms || liveRows[0].ts_ms;
+    const last = liveRows[liveRows.length - 1].recv_ts_ms || liveRows[liveRows.length - 1].ts_ms;
+    return liveRows.length >= LIVE_WARMUP_ROWS || last - first >= LIVE_WARMUP_MS;
+  }
+  function revealCharts() {
+    els.exportButton.disabled = false;
+    els.clearButton.disabled = false;
+    els.priceEmpty.classList.add('hidden');
+    els.heatmapEmpty.classList.add('hidden');
+  }
 
   async function loadMarkets() {
     const value = els.marketInput.value.trim();
-    if (!value) return setMessage('Paste a Polymarket URL or slug first.', true);
+    if (!value) return setMessage('Search or paste a Polymarket URL / slug first.', true);
     disconnect();
     setMessage('Resolving market…');
     els.loadButton.disabled = true;
@@ -53,7 +72,13 @@
         return o;
       }));
       els.marketChooser.classList.remove('hidden');
-      setMessage(markets.length === 1 ? `${markets[0].a_label} / ${markets[0].aprime_label} ready.` : `${markets.length} binary submarkets found — choose one.`);
+      if (markets.length === 1) {
+        els.marketSelect.value = '0';
+        setMessage(`${markets[0].a_label} / ${markets[0].aprime_label} — connecting automatically…`);
+        queueMicrotask(() => connect());
+      } else {
+        setMessage(`${markets.length} binary submarkets found — choose one.`);
+      }
     } catch (err) {
       markets = [];
       els.marketChooser.classList.add('hidden');
@@ -63,26 +88,78 @@
     }
   }
 
+  async function loadHistory(market, serial) {
+    try {
+      const res = await fetch('/api/history', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({...market, max_rows: 6000, archive_files: 6}),
+      });
+      const data = await res.json();
+      if (serial !== historySerial) return;
+      historyRows = Array.isArray(data.rows) ? data.rows : [];
+
+      if (!historyRows.length) {
+        if (!liveReady()) {
+          const why = data.error ? ` (${data.error})` : '';
+          setMessage(`No recent PMXT archive rows for this market${why}; collecting live data.`);
+        }
+        return;
+      }
+
+      if (!liveReady()) {
+        rows = historyRows;
+        showingHistory = true;
+        revealCharts();
+        updateMetrics(historyRows[historyRows.length - 1]);
+        scheduleRender();
+        const end = new Date(historyRows[historyRows.length - 1].ts_ms).toLocaleString();
+        setStatus(liveConnected ? 'connected' : 'connecting', liveConnected ? 'Live · archive preview' : 'Archive preview');
+        setMessage(`Showing ${historyRows.length.toLocaleString()} PMXT historical book updates through ${end}; live data is collecting in parallel.`);
+      }
+    } catch (err) {
+      if (serial !== historySerial) return;
+      setMessage(`History bootstrap unavailable (${err.message}); collecting live data.`);
+    }
+  }
+
+  function switchToLive(market) {
+    if (!liveRows.length) return;
+    showingHistory = false;
+    rows = liveRows;
+    updateMetrics(liveRows[liveRows.length - 1]);
+    revealCharts();
+    setStatus(liveConnected ? 'connected' : 'idle', liveConnected ? 'Live' : 'Captured');
+    setMessage(`${market.question} — live window warmed up; showing live paired top-of-book updates.`);
+    scheduleRender();
+  }
+
   function connect() {
     const market = markets[Number(els.marketSelect.value) || 0];
     if (!market) return;
     disconnect(false);
     clearData();
+    const serial = ++historySerial;
+    void loadHistory(market, serial);
+
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const ws = new WebSocket(`${protocol}//${location.host}/ws`);
     socket = ws;
     setStatus('connecting', 'Connecting');
     els.connectButton.disabled = true;
     els.disconnectButton.disabled = false;
-    setMessage(`Opening ${market.a_label} / ${market.aprime_label} order books…`);
+    setMessage(`Opening ${market.a_label} / ${market.aprime_label} live books and loading PMXT history…`);
 
     ws.addEventListener('open', () => ws.send(JSON.stringify(market)));
     ws.addEventListener('message', (ev) => {
       const msg = JSON.parse(ev.data);
       if (msg.type === 'status') {
         if (msg.state === 'connected') {
-          setStatus('connected', 'Live');
-          setMessage(`${market.question} — streaming paired top-of-book updates.`);
+          liveConnected = true;
+          setStatus('connected', showingHistory ? 'Live · archive preview' : 'Live');
+          if (!showingHistory && !rows.length) {
+            setMessage(`${market.question} — live stream connected; loading history / collecting updates.`);
+          }
         }
         return;
       }
@@ -92,20 +169,25 @@
         return;
       }
       if (msg.type === 'tick') {
-        rows.push(msg);
-        if (rows.length > MAX_ROWS) rows.splice(0, rows.length - MAX_ROWS);
+        liveRows.push(msg);
+        if (liveRows.length > MAX_ROWS) liveRows.splice(0, liveRows.length - MAX_ROWS);
+
+        if (showingHistory) {
+          if (liveReady()) switchToLive(market);
+          return;
+        }
+
+        rows = liveRows;
         updateMetrics(msg);
-        els.exportButton.disabled = false;
-        els.clearButton.disabled = false;
-        els.priceEmpty.classList.add('hidden');
-        els.heatmapEmpty.classList.add('hidden');
+        revealCharts();
         scheduleRender();
       }
     });
     ws.addEventListener('close', () => {
       if (socket !== ws) return;
+      liveConnected = false;
       setStatus('idle', 'Disconnected');
-      setMessage(rows.length ? 'Stream stopped; captured data remains available.' : 'Disconnected.');
+      setMessage(liveRows.length ? 'Stream stopped; captured live data remains available.' : 'Disconnected.');
       els.connectButton.disabled = false;
       els.disconnectButton.disabled = true;
       socket = null;
@@ -120,6 +202,8 @@
     if (socket) {
       const s = socket; socket = null; s.close();
     }
+    liveConnected = false;
+    if (update) historySerial += 1;
     els.connectButton.disabled = false;
     els.disconnectButton.disabled = true;
     if (update) setStatus('idle', rows.length ? 'Captured' : 'Idle');
@@ -127,7 +211,10 @@
 
   function clearData() {
     rows = [];
-    els.ballValue.textContent = '—'; els.probValue.textContent = '—'; els.spreadValue.textContent = '—'; els.sampleValue.textContent = '0';
+    liveRows = [];
+    historyRows = [];
+    showingHistory = false;
+    els.ballValue.textContent = '—'; els.ballOdds.textContent = 'log A/A′'; els.probValue.textContent = '—'; els.spreadValue.textContent = '—'; els.sampleValue.textContent = '0';
     els.exportButton.disabled = true; els.clearButton.disabled = true;
     els.priceEmpty.classList.remove('hidden'); els.heatmapEmpty.classList.remove('hidden');
     clearCanvas(els.priceCanvas); clearCanvas(els.heatmapCanvas);
@@ -247,7 +334,6 @@
   }
   function mixColor(u) {
     u = Math.max(0, Math.min(1, u));
-    // dark panel -> muted olive -> accent. Deliberately perceptual-ish and high contrast.
     const stops = [[21,24,32],[72,87,47],[219,255,101]];
     const z=u*2, i=Math.min(1,Math.floor(z)), f=z-i, a=stops[i], b=stops[i+1];
     return `rgb(${Math.round(a[0]+(b[0]-a[0])*f)},${Math.round(a[1]+(b[1]-a[1])*f)},${Math.round(a[2]+(b[2]-a[2])*f)})`;
@@ -287,7 +373,6 @@
         ctx.fillStyle=mixColor(u); ctx.fillRect(x0,yy,Math.max(1,x1-x0),plotH/GRID_N+1);
       }
     }
-    // Overlay the causal selection as a crisp reference.
     ctx.beginPath(); ctx.strokeStyle=css('--text'); ctx.lineWidth=1.15; ctx.globalAlpha=.9;
     data.forEach((r,i)=>{const X=pad.l+(r.ts_ms-t0)/(t1-t0)*plotW,Y=pad.t+(yHi-r.q_ball)/(yHi-yLo)*plotH;i?ctx.lineTo(X,Y):ctx.moveTo(X,Y);}); ctx.stroke();ctx.globalAlpha=1;
     els.colorLegend.lastElementChild.textContent = `${rawMax < 10 ? rawMax.toFixed(1) : rawMax.toFixed(0)} s (p97)`;
@@ -304,12 +389,13 @@
   }
 
   function exportCsv() {
-    if (!rows.length) return;
-    const keys=['ts_ms','recv_ts_ms','market','a_label','aprime_label','a_bid','a_ask','aprime_bid','aprime_ask','q_bid','q_ask','q_mid','q_ratio_of_mids','q_ball'];
+    const exportRows = liveRows.length ? liveRows : rows;
+    if (!exportRows.length) return;
+    const keys=['source','historical','ts_ms','recv_ts_ms','market','a_label','aprime_label','a_bid','a_ask','aprime_bid','aprime_ask','q_bid','q_ask','q_mid','q_ratio_of_mids','q_ball'];
     const esc=v=>{const s=String(v??'');return /[",\n]/.test(s)?`"${s.replaceAll('"','""')}"`:s;};
-    const csv=[keys.join(','), ...rows.map(r=>keys.map(k=>esc(r[k])).join(','))].join('\n');
+    const csv=[keys.join(','), ...exportRows.map(r=>keys.map(k=>esc(r[k])).join(','))].join('\n');
     const blob=new Blob([csv],{type:'text/csv'}); const url=URL.createObjectURL(blob); const a=document.createElement('a');
-    a.href=url; a.download=`orderbook-ball-${rows[0].market || 'market'}.csv`; a.click(); setTimeout(()=>URL.revokeObjectURL(url),1000);
+    a.href=url; a.download=`orderbook-ball-${exportRows[0].market || 'market'}.csv`; a.click(); setTimeout(()=>URL.revokeObjectURL(url),1000);
   }
 
   els.loadButton.addEventListener('click', loadMarkets);

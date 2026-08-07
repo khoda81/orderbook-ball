@@ -10,6 +10,7 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 
 from .core import TopOfBook, clip_ball, naive_ratio_of_mids, ratio_interval
+from .history import load_pmxt_history
 from .polymarket import (
     BinaryMarket,
     EventSearchResult,
@@ -48,6 +49,18 @@ def _search_json(event: EventSearchResult) -> dict[str, object]:
         "end_date": event.end_date,
         "binary_market_count": event.binary_market_count,
     }
+
+
+def _market_from_config(config: dict) -> BinaryMarket:
+    return BinaryMarket(
+        slug=str(config.get("slug") or "manual"),
+        question=str(config.get("question") or ""),
+        condition_id=str(config.get("condition_id") or ""),
+        a_label=str(config.get("a_label") or "A"),
+        aprime_label=str(config.get("aprime_label") or "A'"),
+        a_token=str(config["a_token"]),
+        aprime_token=str(config["aprime_token"]),
+    )
 
 
 def create_app() -> FastAPI:
@@ -91,6 +104,39 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail=f"{type(exc).__name__}: {exc}") from exc
         return {"markets": [_market_json(m) for m in found]}
 
+    @app.post("/api/history")
+    async def history(config: dict):
+        """Best-effort PMXT archive bootstrap; never blocks the live path on failure."""
+        try:
+            market = _market_from_config(config)
+            if not market.condition_id:
+                return {"source": "pmxt-v2", "rows": [], "error": "market has no condition id"}
+            result = await load_pmxt_history(
+                market,
+                max_rows=int(config.get("max_rows") or 6000),
+                archive_files=int(config.get("archive_files") or 6),
+            )
+            return {
+                "source": result.source,
+                "rows": result.rows,
+                "archive_file_count": result.archive_file_count,
+                "newest_archive_hour": result.newest_archive_hour,
+            }
+        except Exception as exc:
+            # History is a convenience/bootstrap. A live market should remain fully
+            # usable even if PMXT, DuckDB/httpfs, or the user's network is unhappy.
+            LOGGER.warning(
+                "PMXT history bootstrap failed for market=%r: %s",
+                config.get("slug") or config.get("condition_id"),
+                exc,
+                exc_info=True,
+            )
+            return {
+                "source": "pmxt-v2",
+                "rows": [],
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
     @app.websocket("/ws")
     async def stream(ws: WebSocket):
         await ws.accept()
@@ -98,15 +144,7 @@ def create_app() -> FastAPI:
         heartbeat = None
         try:
             config = await asyncio.wait_for(ws.receive_json(), timeout=20)
-            market = BinaryMarket(
-                slug=str(config.get("slug") or "manual"),
-                question=str(config.get("question") or ""),
-                condition_id=str(config.get("condition_id") or ""),
-                a_label=str(config.get("a_label") or "A"),
-                aprime_label=str(config.get("aprime_label") or "A'"),
-                a_token=str(config["a_token"]),
-                aprime_token=str(config["aprime_token"]),
-            )
+            market = _market_from_config(config)
 
             await ws.send_json({"type": "status", "state": "connecting"})
             upstream = await connect_market_ws(ping_interval=None, close_timeout=3)
@@ -159,6 +197,8 @@ def create_app() -> FastAPI:
                 sequence += 1
                 await ws.send_json({
                     "type": "tick",
+                    "source": "live",
+                    "historical": False,
                     "sequence": sequence,
                     "ts_ms": source_ts,
                     "recv_ts_ms": recv_ts_ms,
