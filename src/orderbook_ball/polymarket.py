@@ -3,18 +3,20 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass
+import logging
 from pathlib import Path
 import time
 from urllib.parse import urlparse
 
-import httpx
+from polymarket import AsyncPublicClient, Event, Market
+from polymarket.errors import RequestRejectedError
 import websockets
 
 from .core import TopOfBook
 from .io import RatioRecorder
 
-GAMMA = "https://gamma-api.polymarket.com"
 WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+LOGGER = logging.getLogger("orderbook_ball.polymarket")
 
 
 @dataclass(frozen=True)
@@ -42,15 +44,6 @@ class EventSearchResult:
     binary_market_count: int
 
 
-def _decode_jsonish(value):
-    if isinstance(value, str):
-        try:
-            return json.loads(value)
-        except json.JSONDecodeError:
-            return value
-    return value
-
-
 def _slug_from_input(value: str) -> str:
     if "://" in value:
         path = urlparse(value).path.rstrip("/")
@@ -58,130 +51,170 @@ def _slug_from_input(value: str) -> str:
     return value.strip().rstrip("/").split("/")[-1]
 
 
-def _market_from_gamma(m: dict) -> BinaryMarket | None:
-    outcomes = _decode_jsonish(m.get("outcomes"))
-    token_ids = _decode_jsonish(m.get("clobTokenIds") or m.get("clob_token_ids"))
-    if not isinstance(outcomes, list) or not isinstance(token_ids, list):
-        return None
-    if len(outcomes) != 2 or len(token_ids) != 2:
+def _market_from_sdk(market: Market) -> BinaryMarket | None:
+    yes = market.outcomes.yes
+    no = market.outcomes.no
+    if yes.token_id is None or no.token_id is None:
         return None
     return BinaryMarket(
-        slug=str(m.get("slug") or "market"),
-        question=str(m.get("question") or m.get("title") or ""),
-        condition_id=str(m.get("conditionId") or m.get("condition_id") or ""),
-        a_label=str(outcomes[0]),
-        aprime_label=str(outcomes[1]),
-        a_token=str(token_ids[0]),
-        aprime_token=str(token_ids[1]),
+        slug=str(market.slug or market.id),
+        question=str(market.question or market.group_item_title or ""),
+        condition_id=str(market.condition_id or ""),
+        a_label=str(yes.label),
+        aprime_label=str(no.label),
+        a_token=str(yes.token_id),
+        aprime_token=str(no.token_id),
     )
 
 
-def _number(value) -> float | None:
-    if value is None or value == "":
+def _is_live_binary_market(market: Market) -> bool:
+    state = market.state
+    if state.closed is True or state.archived is True:
+        return False
+    if state.active is False or state.enable_order_book is False:
+        return False
+    return _market_from_sdk(market) is not None
+
+
+def _event_icon(event: Event) -> str:
+    for optimized in (event.display.icon_optimized, event.display.image_optimized):
+        if optimized is not None:
+            url = optimized.image_url_optimized or optimized.image_url_source
+            if url:
+                return str(url)
+    return str(event.icon or event.image or "")
+
+
+def _to_float(value) -> float | None:
+    if value is None:
         return None
     try:
         return float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
-def _event_icon(event: dict) -> str:
-    for optimized_key in ("iconOptimized", "imageOptimized"):
-        optimized = event.get(optimized_key)
-        if isinstance(optimized, dict):
-            url = optimized.get("imageUrlOptimized") or optimized.get("imageUrlSource")
-            if url:
-                return str(url)
-    return str(event.get("icon") or event.get("image") or "")
-
-
-def _is_live_binary_market(raw: dict) -> bool:
-    if raw.get("closed") is True or raw.get("archived") is True:
-        return False
-    if raw.get("active") is False or raw.get("enableOrderBook") is False:
-        return False
-    return _market_from_gamma(raw) is not None
-
-
-def _search_result_from_gamma(event: dict) -> EventSearchResult | None:
-    markets = event.get("markets") or []
-    if not isinstance(markets, list):
-        return None
-    binary_count = sum(1 for market in markets if isinstance(market, dict) and _is_live_binary_market(market))
-    if binary_count == 0:
+def _search_result_from_sdk(event: Event) -> EventSearchResult | None:
+    binary_count = sum(1 for market in event.markets if _is_live_binary_market(market))
+    if binary_count == 0 or not event.slug:
         return None
 
-    title = str(event.get("title") or event.get("question") or "Untitled event")
-    subtitle = str(event.get("subtitle") or event.get("category") or "")
+    end_date = event.schedule.end_date
     return EventSearchResult(
-        event_id=str(event.get("id") or ""),
-        slug=str(event.get("slug") or ""),
-        title=title,
-        subtitle=subtitle,
+        event_id=str(event.id),
+        slug=str(event.slug),
+        title=str(event.title or "Untitled event"),
+        subtitle=str(event.subtitle or event.category or ""),
         icon=_event_icon(event),
-        volume=_number(event.get("volume")),
-        volume_24h=_number(event.get("volume24hr") or event.get("volume_24hr")),
-        liquidity=_number(event.get("liquidity")),
-        end_date=str(event.get("endDate") or event.get("end_date") or ""),
+        volume=_to_float(event.metrics.volume),
+        volume_24h=_to_float(event.metrics.volume_24hr),
+        liquidity=_to_float(event.metrics.liquidity),
+        end_date=end_date.isoformat() if end_date is not None else "",
         binary_market_count=binary_count,
     )
 
 
 async def search_binary_events(query: str, limit: int = 8) -> list[EventSearchResult]:
-    """Search Polymarket's public Gamma catalog for active events with binary CLOB markets."""
+    """Search active Polymarket events through the official Python SDK."""
     query = query.strip()
     if len(query) < 2:
         return []
     limit = max(1, min(int(limit), 12))
-    params = {
-        "q": query,
-        "events_status": "active",
-        "limit_per_type": min(24, max(limit * 2, 8)),
-        "keep_closed_markets": 0,
-        "search_tags": False,
-        "search_profiles": False,
-    }
-    async with httpx.AsyncClient(timeout=10) as client:
-        response = await client.get(f"{GAMMA}/public-search", params=params)
-        response.raise_for_status()
-        payload = response.json()
+    page_size = min(24, max(limit * 2, 8))
 
-    events = payload.get("events") if isinstance(payload, dict) else None
-    if not isinstance(events, list):
-        return []
+    async with AsyncPublicClient(logger=LOGGER) as client:
+        try:
+            first = await client.search(
+                q=query,
+                events_status="active",
+                keep_closed_markets=0,
+                search_tags=False,
+                search_profiles=False,
+                page_size=page_size,
+            ).first_page()
+        except RequestRejectedError as exc:
+            # Gamma occasionally changes optional search behavior independently of
+            # the SDK. A minimal SDK request is a useful fallback and still keeps
+            # all URL construction, parameter encoding, and response parsing typed.
+            LOGGER.warning(
+                "filtered Polymarket search rejected for %r (%s); retrying minimal search",
+                query,
+                exc,
+            )
+            first = await client.search(q=query, page_size=page_size).first_page()
 
     results: list[EventSearchResult] = []
-    for event in events:
-        if not isinstance(event, dict):
-            continue
-        result = _search_result_from_gamma(event)
-        if result is not None:
-            results.append(result)
-        if len(results) >= limit:
-            break
+    for bundle in first.items:
+        for event in bundle.events:
+            result = _search_result_from_sdk(event)
+            if result is not None:
+                results.append(result)
+            if len(results) >= limit:
+                return results
     return results
 
 
-async def resolve_binary_markets(value: str) -> list[BinaryMarket]:
-    """Resolve a Polymarket market/event URL or slug into binary CLOB markets."""
-    slug = _slug_from_input(value)
-    async with httpx.AsyncClient(timeout=15) as client:
-        # A direct market slug is the cheapest and most precise lookup.
-        r = await client.get(f"{GAMMA}/markets", params={"slug": slug})
-        r.raise_for_status()
-        markets = r.json()
-        if isinstance(markets, list):
-            direct = [x for x in (_market_from_gamma(m) for m in markets) if x]
-            if direct:
-                return direct
+def _event_binary_markets(event: Event, *, live_only: bool = False) -> list[BinaryMarket]:
+    out: list[BinaryMarket] = []
+    for market in event.markets:
+        if live_only and not _is_live_binary_market(market):
+            continue
+        parsed = _market_from_sdk(market)
+        if parsed is not None:
+            out.append(parsed)
+    return out
 
-        # Event URLs may contain one or several binary submarkets.
-        r = await client.get(f"{GAMMA}/events/slug/{slug}")
-        r.raise_for_status()
-        event = r.json()
-        candidates = [x for x in (_market_from_gamma(m) for m in event.get("markets", [])) if x]
+
+async def resolve_binary_markets(value: str) -> list[BinaryMarket]:
+    """Resolve a Polymarket market/event URL or slug through the official SDK."""
+    value = value.strip()
+    if not value:
+        raise RuntimeError("empty Polymarket market/event value")
+
+    async with AsyncPublicClient(logger=LOGGER) as client:
+        # The SDK understands canonical Polymarket URLs. Event pages are the
+        # pleasant human-facing form, while nested event/market URLs resolve as
+        # individual markets.
+        if "://" in value:
+            parsed = urlparse(value)
+            segments = [segment for segment in parsed.path.split("/") if segment]
+            if len(segments) == 2 and segments[0] == "event":
+                event = await client.get_event(url=value)
+                candidates = _event_binary_markets(event, live_only=True)
+                if candidates:
+                    return candidates
+                raise RuntimeError(f"no live binary CLOB market found for {value!r}")
+
+            try:
+                market = await client.get_market(url=value)
+                candidate = _market_from_sdk(market)
+                if candidate is not None and _is_live_binary_market(market):
+                    return [candidate]
+            except RequestRejectedError:
+                pass
+
+        slug = _slug_from_input(value)
+        market_error: Exception | None = None
+        try:
+            market = await client.get_market(slug=slug)
+            candidate = _market_from_sdk(market)
+            if candidate is not None and _is_live_binary_market(market):
+                return [candidate]
+        except Exception as exc:
+            market_error = exc
+
+        try:
+            event = await client.get_event(slug=slug)
+        except Exception as event_error:
+            if market_error is not None:
+                raise RuntimeError(
+                    f"could not resolve Polymarket market/event {value!r}: {event_error}"
+                ) from event_error
+            raise
+
+        candidates = _event_binary_markets(event, live_only=True)
         if not candidates:
-            raise RuntimeError(f"no binary CLOB market found for {value!r}")
+            raise RuntimeError(f"no live binary CLOB market found for {value!r}")
         return candidates
 
 

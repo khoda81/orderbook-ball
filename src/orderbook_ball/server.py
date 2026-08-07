@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 import time
 
@@ -20,6 +21,7 @@ from .polymarket import (
 )
 
 WEB_DIR = Path(__file__).with_name("web")
+LOGGER = logging.getLogger("uvicorn.error")
 
 
 def _market_json(m: BinaryMarket) -> dict[str, str]:
@@ -76,7 +78,9 @@ def create_app() -> FastAPI:
         try:
             found = await search_binary_events(query, limit=limit)
         except Exception as exc:  # Upstream discovery boundary.
-            raise HTTPException(status_code=502, detail=f"Polymarket search failed: {exc}") from exc
+            LOGGER.exception("Polymarket search failed for query=%r limit=%s", query, limit)
+            detail = f"Polymarket search failed: {type(exc).__name__}: {exc}"
+            raise HTTPException(status_code=502, detail=detail) from exc
         return {"events": [_search_json(event) for event in found]}
 
     @app.get("/api/markets")
@@ -84,7 +88,8 @@ def create_app() -> FastAPI:
         try:
             found = await resolve_binary_markets(value)
         except Exception as exc:  # API boundary: return a useful browser error.
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            LOGGER.exception("Polymarket market resolution failed for value=%r", value)
+            raise HTTPException(status_code=400, detail=f"{type(exc).__name__}: {exc}") from exc
         return {"markets": [_market_json(m) for m in found]}
 
     @app.websocket("/ws")
@@ -176,6 +181,7 @@ def create_app() -> FastAPI:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            LOGGER.exception("Polymarket live stream failed")
             try:
                 await ws.send_json({"type": "error", "message": str(exc)})
             except Exception:
@@ -203,4 +209,4 @@ def run(host: str = "127.0.0.1", port: int = 8765, open_browser: bool = True) ->
 
     if open_browser:
         threading.Timer(0.8, lambda: webbrowser.open(f"http://{host}:{port}")).start()
-    uvicorn.run(app, host=host, port=port, log_level="warning")
+    uvicorn.run(app, host=host, port=port, log_level="info", access_log=True)
